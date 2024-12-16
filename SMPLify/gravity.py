@@ -5,10 +5,10 @@ class GravityLoss():
     def __init__(self,
                  dist_dict,
                  bed_depth=1.66,
-                 alpha_inside_torso=1,
-                 beta1=0.05,
-                 beta2=0.5,
-                 beta_inside_torso=1.5,
+                 gravity_beta1=0.05,
+                 gravity_beta2=0.5,
+                 gravity_inside_torso_alpha=1,
+                 gravity_inside_torso_beta=1.5,
                  device='cuda',
                  dtype=torch.float32):
         self.device = device
@@ -17,10 +17,10 @@ class GravityLoss():
         self.dist_dict = dist_dict
         self.bed_depth = bed_depth
         
-        self.alpha_inside_torso = alpha_inside_torso
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.beta_inside_torso = beta_inside_torso
+        self.beta1 = gravity_beta1
+        self.beta2 = gravity_beta2
+        self.alpha_inside_torso = gravity_inside_torso_alpha
+        self.beta_between_torso = gravity_inside_torso_beta
         
     
     def __call__(self,
@@ -60,14 +60,7 @@ class GravityLoss():
                                     torch.cat([gt_joints_2d[:, [7, 8]],
                                                 torch.zeros([batch_size, 2, 1], device=self.device, dtype=self.dtype)], dim=-1))
         hand_gravity_weight[inside_torso & (cosine[:, 2:4] > 0.55)] = 1 / self.beta1 * self.beta_inside_torso
-        # inside neck or leg: probably hand moving through neck or leg
-        # inside_neck = polygon_method(torch.cat([gt_joints_2d[:, [2, 1, 3, 4]],
-        #                                          torch.zeros([batch_size, 4, 1], device=device, dtype=dtype)], dim=-1),
-        #                               torch.cat([gt_joints_2d[:, [7, 8]],
-        #                                          torch.zeros([batch_size, 2, 1], device=device, dtype=dtype)], dim=-1))
-        # hand_gravity_weight[inside_neck & (cosine[:, 2:4] > 0.55)] = 0
-        # hand_gravity_err[inside_torso & (cosine[:, 2:4] > 0.55)] = \
-        #     hand_gravity_err[inside_torso & (cosine[:, 2:4] > 0.55)] - 0.2
+        # inside leg: probably hand moving through leg
         inside_leg = polygon_method(torch.cat([gt_joints_2d[:, [9, 11, 12, 10]],
                                             torch.zeros([batch_size, 4, 1], device=self.device, dtype=self.dtype)], dim=-1),
                                     torch.cat([gt_joints_2d[:, [7, 8]],

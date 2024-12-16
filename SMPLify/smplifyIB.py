@@ -1,66 +1,123 @@
 import numpy as np
 import smplx
 from tqdm import tqdm
+import time
 from .prior import MaxMixturePrior
 from .losses import MotionOptLoss
 from config import config
 
+from data.essentials.segments.smpl import segm_utils as exn
 from utils.optimizers.optim_factory import create_optimizer
-from utils.joints.evaluate import joint_mapping
+from utils.geometry.camera import PerspectiveCamera
+from utils.contact.Segmentation import BatchBodySegment
+from SMPLify.losses import GravityFittingLoss, SelfcontactFittingLoss, CameraFittingLoss
+
 from core.evaluate import *
 from datetime import datetime
-from utils.others.loss_record import print_loss
-
-from pytorch3d.renderer import (
-                                RasterizationSettings, MeshRenderer,
-                                MeshRasterizer,
-                                SoftSilhouetteShader,
-                                )
-from pytorch3d.renderer.cameras import OrthographicCameras
 
 class SMPLifyIB():
 
     def __init__(self,
-                 loader,
                  step_size=1e-2,
                  num_iters=300,
-                 device=torch.device('cuda'),
+                 batch_size=128,
+                 bed_depth=1.66,
                  weight=None,
+                 model_type='smpl',
+                 sc_type='ours',
+                 dtype=torch.float32,
+                 device=torch.device('cuda'),
                  ):
-        self.loader = loader
         self.device = device
+        self.dtype = dtype
+        
         self.step_size = step_size
-
         self.num_iters = num_iters
+        self.batch_size = batch_size
+        
+        # camera
+        camera = PerspectiveCamera(focal_length_x=941,
+                                   focal_length_y=941,
+                                   batch_size=batch_size,
+                                   center=torch.Tensor([1080 // 2, 1920 // 2]),
+                                   dtype=dtype)
+        self.camera = camera.to(device=device)
 
-        # self.pose_prior = MaxMixturePrior(prior_folder=config.PRIOR_FOLDER, num_gaussians=8,
-        #                                   dtype=torch.float32).to(device)
-        self.smpl = smplx.create('/workspace/wzy1999/Public_Dataset/checkpoints/smpl/data/models',
-                                 model_type='smpl').to(self.device)
+        self.body_model = smplx.create(config.SMPL_MODEL_DIR, model_type=model_type, gender='neutral').to(self.device).eval()
+        
+        self.faces = self.body_model.faces
         self.face_tensor = torch.tensor(self.smpl.faces.astype(np.int64), dtype=torch.long,
-                                        device=self.device).unsqueeze_(0).repeat([self.args.seqlen, 1, 1])
+                                        device=self.device).unsqueeze_(0).repeat([128, 1, 1])
+        self.segments = BatchBodySegment([x for x in exn.segments.keys()], self.face_tensor[0])
+        
+        # parameters for self-contact
+        geodistssmpl = torch.tensor(np.load(config.SMPL_GEODIST), dtype=self.dtype, device=self.device)
+        self.modified_geodistssmpl, self.geomask, self.search_tree, self.pen_distance, self.tuch_segment = None, None, None, None, None
+        if sc_type == 'ours':
+            from utils.contact.Contact import modify_geodistsmpl
+            self.modified_geodistssmpl = modify_geodistsmpl(geodistssmpl, self.segments)
+            self.geomask = self.modified_geodistssmpl < weight['geothres']
+        elif sc_type == 'bvh':
+            from mesh_intersection.bvh_search_tree import BVH
+            import mesh_intersection.loss as collisions_loss
+            from mesh_intersection.filter_faces import FilterFaces
+            import pickle
+            
+            ign_part_pairs = ['9,16', '9,17', '6,16', '6,17', '1,2', '12,22']
+            max_collisions = 128
+            df_cone_height = 0.0001
+            penalize_outside = True
+            point2plane = False
 
-        self.smpl_joints_index, self.label_index = joint_mapping(cal_mode)
+            search_tree = BVH(max_collisions=max_collisions)
 
-        self.bed_depth = torch.Tensor([0, 0, bed_depth]).to(device)
+            pen_distance = \
+                collisions_loss.DistanceFieldPenetrationLoss(
+                    sigma=df_cone_height, point2plane=point2plane,
+                    vectorized=True, penalize_outside=penalize_outside)
 
-        self.results_record = np.zeros((self.loader.dataset.get_data_len(), 6))
-        self.joints_record = np.zeros((self.loader.dataset.get_data_len(), 24, 3))
+            self.search_tree = search_tree
+            self.pen_distance = pen_distance
+        elif sc_type == 'tuch':
+            from utils.ori_tuch.Segmentation import BatchBodySegment as tuch_BatchBodySegment
+            self.tuch_segment = tuch_BatchBodySegment([x for x in exn.segments.keys()], self.face_tensor[0])
+            self.geodistssmpl = geodistssmpl
+            self.geomask = self.geodistssmpl > weight['geothres']
+        else:
+            print('unknown sc type, exit')
+            exit(0)
+        
+        # parameters for gravity
+        self.bed_depth = bed_depth
+        
+        # necessarily observed parameters
+        self.dist_dict = None
+        self.gt_vel_mask = None
+        self.prev_result = None
 
-        print(balance_loss)
-        self.loss = MotionOptLoss(
-            args=self.args,
-            faces=self.face_tensor,
-            balance_weight=weight['balance_loss'],
-            smpl_loss_weight=weight['smpl_loss_weight'],
-            joint_loss_weight=weight['joint_loss_weight'],
-            smooth_weight=weight['smooth_weight'],
-            pre_smooth_weight=weight['pre_smooth_weight'],
-            contact_loss_weight=0.001,
-            device=device
-        )
+        self.gravity_fitting_loss = 
+        
 
-    def fit(self):
+    def fit(self, loader, stage='gravity', sc_type='ours', fit_min=0, fit_max=10000):
+        prev_result = None
+        for batch in loader:
+            batch = {k: v.type(torch.float32).squeeze().detach().to(self.device).requires_grad_(False) for k, v in
+                        batch.items()}
+            idx = batch['idx'].cpu().numpy().astype(np.int64).tolist()
+            if idx[0] < fit_min:
+                continue
+                pass
+            keypoints_2d = batch['keypoints_pix']
+            init_pose = batch['est_pose']
+            init_betas = batch['est_betas']
+            init_trans = batch['est_trans']
+            print(time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())),
+                    f', {idx[0]} - {idx[1]} start')
+            if prev_result is not None:
+                # print(smplify.prev_result)
+                pass
+            output, loss_dict = self.
+
 
         num_steps_total = len(self.loader.dataset) // self.args.batch_size
 
@@ -85,6 +142,43 @@ class SMPLifyIB():
         np.save(f'results/{self.args.note}_joints.npy', self.joints_record)
 
         return np.mean(self.results_record[:, 0])
+
+
+    def gravity_opt(self, batch):
+        """Preform gravity fitting
+        Args:
+            batch (dict): {'init_betas', 'init_trans', 'init_pose', 'gt_keypoints_2d', 'idx'},
+        Return:
+            output(dict): {'betas', 'pose', 'trans'},
+            loss_dict(dict)
+        """
+        gt_joints_2d = batch['gt_keypoints_2d'][:, :, :2].clone()
+        joints_conf = batch['gt_keypoints_2d'][:, :, -1].clone()
+        
+        camera_translation = batch['init_trans'].clone()
+        body_pose_1 = batch['init_pose'][:, 3:30].detach().clone()
+        body_pose_foot = batch['init_pose'][:, 30:36].detach().clone()
+        body_pose_2 = batch['init_pose'][:, 36:].detach().clone()
+        global_orient = batch['init_pose'][:, :3].detach().clone()
+        betas = batch['init_betas'].detach().clone()
+        
+        # Step 0, camera fitting
+        camera_translation.requires_grad = True
+        body_pose_1.requires_grad = False
+        body_pose_foot.requires_grad = False
+        body_pose_2.requires_grad = False
+        betas.requires_grad = False
+        global_orient.requires_grad = False
+        
+        camera_opt_params = [camera_translation]
+        camera_optimizer, _ = create_optimizer(camera_opt_params,
+                                               optim_type=self.optim_type,
+                                               lr=self.step_size,
+                                               maxiters=50)
+        for i in range(80):
+            
+        
+
 
     def vae_opt(self, batch):
         """Perform body fitting.

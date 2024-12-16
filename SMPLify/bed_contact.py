@@ -1,7 +1,7 @@
 import torch
 
 
-class BedContact():
+class BedContactLoss():
     def __init__(self,
                  bed_depth=1.66,
                  segments=None,
