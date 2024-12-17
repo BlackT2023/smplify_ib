@@ -16,8 +16,8 @@ from config import config
 class GravityFittingLoss():
     def __init__(self,
                  weights,
-                 dist_dict,
                  camera,
+                 dist_dict=None,
                  bc_type='simple',
                  sc_type='ours',
                  bed_depth=1.66,
